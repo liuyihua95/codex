@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ModelsClient;
+use codex_api::ModelsListResponse;
 use codex_api::RequestTelemetry;
 use codex_api::ReqwestTransport;
 use codex_api::TransportError;
@@ -27,6 +28,7 @@ use codex_login::default_client::create_client_for_route_async;
 use codex_model_provider_info::CHATGPT_CODEX_BASE_URL;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::ModelCatalogOriginator;
+use codex_models_manager::manager::ConditionalModelsEndpointResponse;
 use codex_models_manager::manager::ModelsEndpointClient;
 use codex_models_manager::manager::ModelsEndpointFuture;
 use codex_models_manager::manager::ModelsEndpointResponse;
@@ -37,6 +39,8 @@ use codex_response_debug_context::extract_response_debug_context;
 use codex_response_debug_context::telemetry_transport_error_message;
 use codex_runtime_agent_instance::RuntimeAuthManager;
 use http::HeaderMap;
+use http::HeaderValue;
+use http::header::IF_NONE_MATCH;
 use tokio::time::timeout;
 
 use crate::auth::ResolvedProviderAuth;
@@ -108,19 +112,26 @@ impl OpenAiModelsEndpoint {
         client_version: &str,
         http_client_factory: HttpClientFactory,
     ) -> CoreResult<ModelsEndpointResponse> {
-        timeout(
+        match timeout(
             MODELS_REFRESH_TIMEOUT,
-            self.fetch_models(client_version, http_client_factory),
+            self.fetch_models(client_version, None, http_client_factory),
         )
         .await
-        .map_err(|_| CodexErr::RequestTimeout)?
+        .map_err(|_| CodexErr::RequestTimeout)??
+        {
+            ConditionalModelsEndpointResponse::Modified(response) => Ok(response),
+            ConditionalModelsEndpointResponse::NotModified { .. } => Err(CodexErr::InvalidRequest(
+                "models endpoint returned 304 without a conditional request".to_string(),
+            )),
+        }
     }
 
     async fn fetch_models(
         &self,
         client_version: &str,
+        etag: Option<&str>,
         http_client_factory: HttpClientFactory,
-    ) -> CoreResult<ModelsEndpointResponse> {
+    ) -> CoreResult<ConditionalModelsEndpointResponse> {
         let provider_info = self.provider_info.clone();
         let auth_manager = self.auth_manager.clone();
         let runtime_auth = self.runtime_auth.clone();
@@ -238,17 +249,24 @@ impl OpenAiModelsEndpoint {
             agent_identity_telemetry,
             auth_env: self.auth_env(),
         });
-        let (models, etag) = {
+        let response = {
             let transport = self
                 .transport_builder
                 .build(http_client_factory, request_url.clone())
                 .await?;
             let client = ModelsClient::new(transport, api_provider, api_auth)
                 .with_telemetry(Some(request_telemetry));
+            let mut headers = HeaderMap::new();
+            if let Some(etag) = etag {
+                let value = etag.parse::<HeaderValue>().map_err(|_| {
+                    CodexErr::InvalidRequest("cached model catalog ETag is invalid".to_string())
+                })?;
+                headers.insert(IF_NONE_MATCH, value);
+            }
             client
-                .list_models(
+                .list_models_conditional(
                     request_url,
-                    HeaderMap::new(),
+                    headers,
                     /*response_body_limit_bytes*/ None,
                 )
                 .await
@@ -269,6 +287,12 @@ impl OpenAiModelsEndpoint {
                     map_api_error(error)
                 })
         }?;
+        let (models, etag) = match response {
+            ModelsListResponse::Modified { models, etag } => (models, etag),
+            ModelsListResponse::NotModified { etag } => {
+                return Ok(ConditionalModelsEndpointResponse::NotModified { etag, identity });
+            }
+        };
         if self.provider_info.model_catalog_url.is_some() {
             let mut slugs = HashSet::new();
             if models
@@ -280,11 +304,13 @@ impl OpenAiModelsEndpoint {
                 ));
             }
         }
-        Ok(ModelsEndpointResponse {
-            models,
-            etag,
-            identity,
-        })
+        Ok(ConditionalModelsEndpointResponse::Modified(
+            ModelsEndpointResponse {
+                models,
+                etag,
+                identity,
+            },
+        ))
     }
 
     fn auth_env(&self) -> AuthEnvTelemetry {
@@ -353,6 +379,22 @@ impl ModelsEndpointClient for OpenAiModelsEndpoint {
             client_version,
             http_client_factory,
         ))
+    }
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        client_version: &'a str,
+        etag: Option<&'a str>,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ConditionalModelsEndpointResponse>> {
+        Box::pin(async move {
+            timeout(
+                MODELS_REFRESH_TIMEOUT,
+                self.fetch_models(client_version, etag, http_client_factory),
+            )
+            .await
+            .map_err(|_| CodexErr::RequestTimeout)?
+        })
     }
 }
 

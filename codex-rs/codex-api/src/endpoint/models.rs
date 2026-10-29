@@ -9,12 +9,25 @@ use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ModelsResponse;
 use http::HeaderMap;
 use http::Method;
+use http::StatusCode;
 use http::header::ETAG;
+use http::header::IF_NONE_MATCH;
 use std::sync::Arc;
 use url::Url;
 
 pub struct ModelsClient<T: HttpTransport> {
     session: EndpointSession<T>,
+}
+
+#[derive(Debug)]
+pub enum ModelsListResponse {
+    Modified {
+        models: Vec<ModelInfo>,
+        etag: Option<String>,
+    },
+    NotModified {
+        etag: Option<String>,
+    },
 }
 
 impl<T: HttpTransport> ModelsClient<T> {
@@ -73,9 +86,35 @@ impl<T: HttpTransport> ModelsClient<T> {
         extra_headers: HeaderMap,
         response_body_limit_bytes: Option<usize>,
     ) -> Result<(Vec<ModelInfo>, Option<String>), ApiError> {
-        let (body, header_etag) = self
-            .list_models_raw(request_url, extra_headers, response_body_limit_bytes)
+        match self
+            .list_models_conditional(request_url, extra_headers, response_body_limit_bytes)
+            .await?
+        {
+            ModelsListResponse::Modified { models, etag } => Ok((models, etag)),
+            ModelsListResponse::NotModified { .. } => Err(ApiError::Stream(
+                "models endpoint returned 304 without a conditional request".to_string(),
+            )),
+        }
+    }
+
+    pub async fn list_models_conditional(
+        &self,
+        request_url: String,
+        extra_headers: HeaderMap,
+        response_body_limit_bytes: Option<usize>,
+    ) -> Result<ModelsListResponse, ApiError> {
+        let allow_not_modified = extra_headers.contains_key(IF_NONE_MATCH);
+        let (status, body, header_etag) = self
+            .list_models_raw(
+                request_url,
+                extra_headers,
+                response_body_limit_bytes,
+                allow_not_modified,
+            )
             .await?;
+        if status == StatusCode::NOT_MODIFIED {
+            return Ok(ModelsListResponse::NotModified { etag: header_etag });
+        }
         let ModelsResponse { models } =
             serde_json::from_slice::<ModelsResponse>(&body).map_err(|e| {
                 ApiError::Stream(format!(
@@ -87,7 +126,10 @@ impl<T: HttpTransport> ModelsClient<T> {
                 ))
             })?;
 
-        Ok((models, header_etag))
+        Ok(ModelsListResponse::Modified {
+            models,
+            etag: header_etag,
+        })
     }
 
     /// Fetches a catalog using the provider's auth and retry policy without decoding it.
@@ -99,7 +141,8 @@ impl<T: HttpTransport> ModelsClient<T> {
         request_url: String,
         extra_headers: HeaderMap,
         response_body_limit_bytes: Option<usize>,
-    ) -> Result<(Bytes, Option<String>), ApiError> {
+        allow_not_modified: bool,
+    ) -> Result<(StatusCode, Bytes, Option<String>), ApiError> {
         let resp = self
             .session
             .execute_with(
@@ -110,6 +153,7 @@ impl<T: HttpTransport> ModelsClient<T> {
                 move |req| {
                     req.url.clone_from(&request_url);
                     req.response_body_limit_bytes = response_body_limit_bytes;
+                    req.allow_not_modified = allow_not_modified;
                 },
             )
             .await?;
@@ -120,7 +164,7 @@ impl<T: HttpTransport> ModelsClient<T> {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
 
-        Ok((resp.body, header_etag))
+        Ok((resp.status, resp.body, header_etag))
     }
 }
 
@@ -148,6 +192,7 @@ mod tests {
         last_request: Arc<Mutex<Option<Request>>>,
         body: Arc<ModelsResponse>,
         etag: Option<String>,
+        status: StatusCode,
     }
 
     impl Default for CapturingTransport {
@@ -156,6 +201,7 @@ mod tests {
                 last_request: Arc::new(Mutex::new(None)),
                 body: Arc::new(ModelsResponse { models: Vec::new() }),
                 etag: None,
+                status: StatusCode::OK,
             }
         }
     }
@@ -169,7 +215,7 @@ mod tests {
                 headers.insert(ETAG, etag.parse().unwrap());
             }
             Ok(Response {
-                status: StatusCode::OK,
+                status: self.status,
                 headers,
                 body: body.into(),
             })
@@ -321,6 +367,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -384,6 +431,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: None,
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -413,6 +461,7 @@ mod tests {
             last_request: Arc::new(Mutex::new(None)),
             body: Arc::new(response),
             etag: Some("\"abc\"".to_string()),
+            status: StatusCode::OK,
         };
 
         let provider = provider("https://example.com/api/codex");
@@ -430,5 +479,33 @@ mod tests {
 
         assert_eq!(models.len(), 0);
         assert_eq!(etag, Some("\"abc\"".to_string()));
+    }
+
+    #[tokio::test]
+    async fn conditional_request_returns_not_modified_without_decoding_body() {
+        let transport = CapturingTransport {
+            status: StatusCode::NOT_MODIFIED,
+            etag: Some("\"abc\"".to_string()),
+            ..Default::default()
+        };
+        let provider = provider("https://example.com/api/codex");
+        let request_url = ModelsClient::<CapturingTransport>::request_url(&provider, "0.1.0");
+        let client = ModelsClient::new(transport.clone(), provider, Arc::new(DummyAuth));
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::IF_NONE_MATCH, "\"abc\"".parse().unwrap());
+
+        let response = client
+            .list_models_conditional(request_url, headers, None)
+            .await
+            .expect("304 should be returned as a conditional result");
+
+        assert!(matches!(
+            response,
+            ModelsListResponse::NotModified { etag } if etag.as_deref() == Some("\"abc\"")
+        ));
+        let request = transport.last_request.lock().unwrap();
+        let request = request.as_ref().unwrap();
+        assert!(request.allow_not_modified);
+        assert_eq!(request.headers[http::header::IF_NONE_MATCH], "\"abc\"");
     }
 }

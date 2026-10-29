@@ -103,6 +103,8 @@ struct TestModelsEndpoint {
     etag: Option<String>,
     fetch_count: AtomicUsize,
     observed_proxy_policy: Mutex<Option<OutboundProxyPolicy>>,
+    return_not_modified: bool,
+    observed_conditional_etags: Mutex<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Default)]
@@ -232,6 +234,13 @@ impl TestModelsEndpoint {
             .expect("observed proxy policy lock should not be poisoned")
     }
 
+    fn observed_conditional_etags(&self) -> Vec<Option<String>> {
+        self.observed_conditional_etags
+            .lock()
+            .expect("observed conditional ETags lock should not be poisoned")
+            .clone()
+    }
+
     async fn list_models(&self) -> CoreResult<ModelsEndpointResponse> {
         self.fetch_count.fetch_add(1, Ordering::SeqCst);
         let models = self
@@ -309,6 +318,29 @@ impl ModelsEndpointClient for TestModelsEndpoint {
                 .expect("observed proxy policy lock should not be poisoned") =
                 Some(http_client_factory.outbound_proxy_policy());
             TestModelsEndpoint::list_models(self).await
+        })
+    }
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        client_version: &'a str,
+        etag: Option<&'a str>,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ConditionalModelsEndpointResponse>> {
+        Box::pin(async move {
+            self.observed_conditional_etags
+                .lock()
+                .expect("observed conditional ETags lock should not be poisoned")
+                .push(etag.map(ToString::to_string));
+            if self.return_not_modified && etag == self.etag.as_deref() {
+                return Ok(ConditionalModelsEndpointResponse::NotModified {
+                    etag: self.etag.clone(),
+                    identity: self.identity().expect("test endpoint identity"),
+                });
+            }
+            ModelsEndpointClient::list_models(self, client_version, http_client_factory)
+                .await
+                .map(ConditionalModelsEndpointResponse::Modified)
         })
     }
 }
@@ -619,6 +651,51 @@ async fn injected_cache_ttl_refresh_preserves_cached_payload() {
         Some(crate::client_version_to_whole())
     );
     assert_eq!(stored_entries[0].models, cached_models);
+}
+
+#[tokio::test]
+async fn online_refresh_revalidates_matching_etag_without_downloading_catalog() {
+    let models = vec![remote_model("cached", "Cached", /*priority*/ 0)];
+    let endpoint = Arc::new(TestModelsEndpoint {
+        uses_codex_backend: true,
+        responses: Mutex::new(vec![Ok(models.clone())].into()),
+        etag: Some("\"catalog-v1\"".to_string()),
+        return_not_modified: true,
+        ..TestModelsEndpoint::default()
+    });
+    let cache = Arc::new(TestModelsCache::default());
+    let manager = OpenAiModelsManager::new_with_cache(
+        cache.clone(),
+        endpoint.clone(),
+        Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+            "test-api-key",
+        ))),
+    );
+    manager.set_api_key_model_discovery_enabled(/*enabled*/ true);
+
+    let first = manager
+        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    let first_fetched_at = manager.remote_models.read().await.entry.fetched_at;
+    let second = manager
+        .raw_model_catalog(RefreshStrategy::Online, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+
+    assert_eq!(first, second);
+    assert_eq!(second.models, models);
+    assert_eq!(endpoint.fetch_count(), 1);
+    assert_eq!(
+        endpoint.observed_conditional_etags(),
+        vec![None, Some("\"catalog-v1\"".to_string())]
+    );
+    assert!(manager.remote_models.read().await.entry.fetched_at >= first_fetched_at);
+    assert_eq!(
+        cache
+            .stored_entries()
+            .last()
+            .and_then(|entry| entry.etag.as_deref()),
+        Some("\"catalog-v1\"")
+    );
 }
 
 async fn chatgpt_auth_tokens_for_tests(codex_home: &Path) -> CodexAuth {

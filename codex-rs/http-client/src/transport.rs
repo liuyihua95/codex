@@ -84,6 +84,7 @@ impl ReqwestTransport {
             compression: _,
             timeout,
             response_body_limit_bytes: _,
+            allow_not_modified: _,
         } = req;
 
         let method = Method::from_bytes(method.as_str().as_bytes()).unwrap_or(Method::GET);
@@ -177,6 +178,7 @@ impl HttpTransport for ReqwestTransport {
 
         let url = req.url.clone();
         let response_body_limit_bytes = req.response_body_limit_bytes;
+        let allow_not_modified = req.allow_not_modified;
         let resp = self.send(req).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -185,7 +187,7 @@ impl HttpTransport for ReqwestTransport {
             Some(max_bytes) => bounded_response_bytes(resp, max_bytes).await,
             None => resp.bytes().await.map_err(Self::map_error),
         };
-        if !status.is_success() {
+        if !status.is_success() && !(allow_not_modified && status == StatusCode::NOT_MODIFIED) {
             let body = match bytes {
                 Ok(bytes) => String::from_utf8(bytes.to_vec()).ok(),
                 Err(

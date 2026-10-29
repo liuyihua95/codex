@@ -84,6 +84,9 @@ pub struct Request {
     /// Maximum accepted response-body bytes, including streaming and error bodies.
     /// `None` leaves the response unbounded.
     pub response_body_limit_bytes: Option<usize>,
+    /// Whether a `304 Not Modified` response should be returned to the caller instead of
+    /// converted into [`crate::TransportError::Http`].
+    pub allow_not_modified: bool,
 }
 
 impl Request {
@@ -96,6 +99,7 @@ impl Request {
             compression: RequestCompression::None,
             timeout: None,
             response_body_limit_bytes: None,
+            allow_not_modified: false,
         }
     }
 

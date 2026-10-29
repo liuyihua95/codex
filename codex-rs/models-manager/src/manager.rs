@@ -86,6 +86,29 @@ pub trait ModelsEndpointClient: fmt::Debug + Send + Sync {
         client_version: &'a str,
         http_client_factory: HttpClientFactory,
     ) -> ModelsEndpointFuture<'a, CoreResult<ModelsEndpointResponse>>;
+
+    fn list_models_conditional<'a>(
+        &'a self,
+        client_version: &'a str,
+        etag: Option<&'a str>,
+        http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<ConditionalModelsEndpointResponse>> {
+        let _ = etag;
+        Box::pin(async move {
+            self.list_models(client_version, http_client_factory)
+                .await
+                .map(ConditionalModelsEndpointResponse::Modified)
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum ConditionalModelsEndpointResponse {
+    Modified(ModelsEndpointResponse),
+    NotModified {
+        etag: Option<String>,
+        identity: String,
+    },
 }
 
 /// Catalog and validation metadata captured using the credentials for one request.
@@ -656,13 +679,20 @@ impl OpenAiModelsManager {
     ) -> CoreResult<()> {
         let client_version = crate::client_version_to_whole();
         let request_identity = self.endpoint_client.identity();
-        let ModelsEndpointResponse {
-            models,
-            etag,
-            identity,
-        } = match self
+        let conditional_etag = {
+            let current = self.remote_models.read().await;
+            request_identity
+                .as_ref()
+                .filter(|identity| current.entry.identity.as_ref() == Some(identity))
+                .and(current.entry.etag.clone())
+        };
+        let response = match self
             .endpoint_client
-            .list_models(&client_version, http_client_factory.clone())
+            .list_models_conditional(
+                &client_version,
+                conditional_etag.as_deref(),
+                http_client_factory.clone(),
+            )
             .await
         {
             Ok(response) => response,
@@ -718,6 +748,36 @@ impl OpenAiModelsManager {
                     }
                 }
                 return Err(error);
+            }
+        };
+        let ModelsEndpointResponse {
+            models,
+            etag,
+            identity,
+        } = match response {
+            ConditionalModelsEndpointResponse::Modified(response) => response,
+            ConditionalModelsEndpointResponse::NotModified { etag, identity } => {
+                if Some(&identity) != self.endpoint_client.identity().as_ref() {
+                    return Ok(());
+                }
+                let mut current = self.remote_models.write().await;
+                if current.entry.identity.as_deref() != Some(&identity)
+                    || current.entry.etag.as_deref() != conditional_etag.as_deref()
+                {
+                    return Ok(());
+                }
+                current.entry.fetched_at = Utc::now();
+                if etag.is_some() {
+                    current.entry.etag = etag;
+                }
+                let entry = current.entry.clone();
+                drop(current);
+                if let Some(cache) = self.cache.as_ref()
+                    && let Err(err) = cache.store(&entry).await
+                {
+                    error!("failed to renew models cache after revalidation: {err}");
+                }
+                return Ok(());
             }
         };
         if Some(&identity) != self.endpoint_client.identity().as_ref() {
